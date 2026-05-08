@@ -6,9 +6,11 @@ parallel processing of multiple video sources (webcam, RTSP, MJPEG).
 """
 
 import cv2
+import socket
 import threading
 import time
 import queue
+from urllib.parse import unquote, urlparse, quote
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Callable, Any, List
 from datetime import datetime
@@ -120,7 +122,11 @@ class CameraStream:
         try:
             return int(source)
         except ValueError:
-            return source
+            # URL-decode so browser-encoded characters like %40 → @ reach OpenCV correctly
+            decoded = unquote(source)
+            if decoded != source:
+                print(f"[CAM] URL-decoded source: {source!r} → {decoded!r}")
+            return decoded
 
     def connect(self) -> bool:
         """
@@ -131,17 +137,57 @@ class CameraStream:
         """
         try:
             source = self._get_video_source()
+            print(f"[CAM] connect() | id={self.camera_info.id} name='{self.camera_info.name}' source={source!r}")
+
+            # OpenCV build info (FFMPEG availability)
+            build_info = cv2.getBuildInformation()
+            has_ffmpeg = 'FFMPEG:                      YES' in build_info
+            print(f"[CAM] OpenCV {cv2.__version__} — FFMPEG built-in: {has_ffmpeg}")
+            if not has_ffmpeg:
+                print(f"[CAM] WARNING — OpenCV was NOT compiled with FFMPEG. RTSP streams will fail. "
+                      f"Install opencv-python (pip install opencv-python) which includes FFMPEG.")
+
+            if isinstance(source, str) and source.startswith('rtsp'):
+                # TCP reachability check before even trying OpenCV
+                try:
+                    parsed = urlparse(source)
+                    host = parsed.hostname
+                    port = parsed.port or 554
+                    sock = socket.create_connection((host, port), timeout=5)
+                    sock.close()
+                    print(f"[CAM] TCP check PASSED — {host}:{port} is reachable ✓")
+                except Exception as tcp_err:
+                    print(f"[CAM] TCP check FAILED — cannot reach {parsed.hostname}:{parsed.port or 554}: {tcp_err}")
+                    print(f"[CAM] → Likely causes: backend and camera on different networks, "
+                          f"port {parsed.port or 554} blocked by firewall, or camera is offline.")
+
             self._cap = cv2.VideoCapture(source)
 
-            if not self._cap.isOpened():
+            if isinstance(source, str) and source.startswith('rtsp'):
+                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
+                print(f"[CAM] RTSP mode — BUFFERSIZE=1, FOURCC=H264 applied")
+
+            opened = self._cap.isOpened()
+            print(f"[CAM] isOpened()={opened} | backend={self._cap.getBackendName() if opened else 'N/A'}")
+
+            if not opened:
+                print(f"[CAM] ERROR — cv2.VideoCapture could not open source={source!r}. "
+                      f"Check: URL typo, camera offline, wrong port, credentials in URL, firewall, or missing codec.")
                 self.camera_info.status = CameraStatus.ERROR
                 return False
+
+            # Log actual capture properties
+            w  = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h  = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = self._cap.get(cv2.CAP_PROP_FPS)
+            print(f"[CAM] Stream opened OK — {w}x{h} @ {fps:.1f} fps")
 
             self.camera_info.status = CameraStatus.ACTIVE
             return True
 
         except Exception as e:
-            print(f"[ERROR] Failed to connect to camera {self.camera_info.id}: {e}")
+            print(f"[CAM] EXCEPTION in connect() for id={self.camera_info.id}: {type(e).__name__}: {e}")
             self.camera_info.status = CameraStatus.ERROR
             return False
 
@@ -171,6 +217,7 @@ class CameraStream:
         self._on_detection = on_detection
         self._on_frame = on_frame
         self._stop_event.clear()
+        self.camera_info.status = CameraStatus.CONNECTING
 
         self._thread = threading.Thread(target=self._processing_loop, daemon=True)
         self._thread.start()
@@ -180,10 +227,14 @@ class CameraStream:
         reconnect_delay = 1
         max_reconnect_delay = self.config.camera.reconnect_timeout
 
+        print(f"[CAM] _processing_loop START | id={self.camera_info.id}")
+        frame_count = 0
+
         while not self._stop_event.is_set():
             if not self._cap or not self._cap.isOpened():
-                print(f"[INFO] Camera {self.camera_info.id}: Attempting reconnect...")
+                print(f"[CAM] No open capture — attempting connect | id={self.camera_info.id} delay={reconnect_delay}s")
                 if not self.connect():
+                    print(f"[CAM] Connect FAILED — retrying in {reconnect_delay}s | id={self.camera_info.id}")
                     time.sleep(reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
                     continue
@@ -192,10 +243,18 @@ class CameraStream:
             ret, frame = self._cap.read()
 
             if not ret:
-                print(f"[WARN] Camera {self.camera_info.id}: Frame read failed")
+                print(f"[CAM] cap.read() returned False (no frame) | id={self.camera_info.id} frames_received_so_far={frame_count}")
                 self._cap.release()
                 self._cap = None
+                self.camera_info.status = CameraStatus.CONNECTING
                 continue
+
+            frame_count += 1
+            if frame_count == 1:
+                h, w = frame.shape[:2]
+                print(f"[CAM] First frame received — {w}x{h} | id={self.camera_info.id}")
+            if frame_count % 300 == 0:
+                print(f"[CAM] Heartbeat — {frame_count} frames processed | id={self.camera_info.id}")
 
             # Store latest frame
             with self._frame_lock:

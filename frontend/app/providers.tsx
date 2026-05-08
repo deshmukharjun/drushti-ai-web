@@ -10,7 +10,7 @@ export const isDevAuthBypassEnabled =
   process.env.NEXT_PUBLIC_ENABLE_DEV_AUTH_BYPASS === 'true'
 
 interface AuthContextType {
-  user: { id: string; email?: string } | null
+  user: { id: string; email?: string; isGuest?: boolean } | null
   signIn: (email: string, password: string) => Promise<{ error: Error | null }>
   signUp: (
     email: string,
@@ -18,6 +18,7 @@ interface AuthContextType {
     fullName: string
   ) => Promise<{ error: Error | null }>
   signOut: () => Promise<void>
+  loginAsGuest: () => void
   loading: boolean
 }
 
@@ -31,11 +32,19 @@ export function useAuth() {
   return context
 }
 
+const GUEST_USER = { id: 'guest', email: 'guest@drushti.local', isGuest: true }
+
 export function Providers({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthContextType['user']>(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    if (document.cookie.includes('guest-mode=true')) {
+      setUser(GUEST_USER)
+      setLoading(false)
+      return
+    }
+
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
@@ -74,12 +83,18 @@ export function Providers({ children }: { children: React.ReactNode }) {
   }
 
   const signOut = async () => {
+    document.cookie = 'guest-mode=; Max-Age=0; path=/'
     await supabase.auth.signOut()
     setUser(null)
   }
 
+  const loginAsGuest = () => {
+    document.cookie = 'guest-mode=true; Max-Age=86400; path=/'
+    setUser(GUEST_USER)
+  }
+
   return (
-    <AuthContext.Provider value={{ user, signIn, signUp, signOut, loading }}>
+    <AuthContext.Provider value={{ user, signIn, signUp, signOut, loginAsGuest, loading }}>
       {children}
     </AuthContext.Provider>
   )

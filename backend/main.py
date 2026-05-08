@@ -254,10 +254,17 @@ async def start_stream(camera_id: str, exam_id: Optional[str] = None):
     if camera_id not in camera_manager.cameras:
         raise HTTPException(status_code=404, detail="Camera not found")
 
+    cam_info = camera_manager.get_camera_info(camera_id)
+    cam_name = cam_info.name if cam_info else '?'
+    cam_url  = repr(cam_info.stream_url) if cam_info else '?'
+    print(f"[API] POST /start | camera_id={camera_id} name='{cam_name}' stream_url={cam_url} exam_id={repr(exam_id)}")
+
     if exam_id and exam_id.strip():
         camera_exam_ids[camera_id] = exam_id.strip()
+        print(f"[API] Exam tagged: camera {camera_id} → exam {exam_id.strip()}")
     else:
         camera_exam_ids.pop(camera_id, None)
+        print(f"[API] No exam_id — stream will run without Supabase snapshot upload")
 
     # Define callback for WebSocket broadcasting
     async def on_detection(result: StreamResult):

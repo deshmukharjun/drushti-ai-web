@@ -13,7 +13,7 @@ export default function LoginPage() {
   const [error, setError] = useState('')
   const [info, setInfo] = useState('')
   const [loading, setLoading] = useState(false)
-  const { signIn, signUp } = useAuth()
+  const { signIn, signUp, loginAsGuest } = useAuth()
   const router = useRouter()
 
   useEffect(() => {
@@ -57,6 +57,11 @@ export default function LoginPage() {
   }
 
   const handleDevLogin = () => {
+    router.push('/dashboard')
+  }
+
+  const handleGuestLogin = () => {
+    loginAsGuest()
     router.push('/dashboard')
   }
 
@@ -211,6 +216,17 @@ export default function LoginPage() {
               </button>
             </div>
           )}
+
+          <div className={`${showDevBypass ? 'mt-3' : 'mt-6 pt-4 border-t border-drushti-outline/40'} text-center`}>
+            <button
+              id="guest-login"
+              type="button"
+              onClick={handleGuestLogin}
+              className="text-sm text-drushti-muted hover:text-drushti-navy transition-colors"
+            >
+              Continue as Guest
+            </button>
+          </div>
         </div>
 
         <p className="text-center text-drushti-hint text-xs mt-6">

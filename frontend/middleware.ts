@@ -26,6 +26,10 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next()
   }
 
+  if (request.cookies.get('guest-mode')?.value === 'true') {
+    return NextResponse.next()
+  }
+
   let supabaseResponse = NextResponse.next({
     request,
   })
