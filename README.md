@@ -83,31 +83,85 @@ If `POST .../auth/v1/signup` is **500**, the `on_auth_user_created` trigger on `
 
 ### Backend
 
+Install dependencies once:
+
 ```bash
 cd backend
 pip install -r requirements.txt
+cp .env.example .env   # PowerShell: Copy-Item .env.example .env
 ```
 
-`cd backend && cp .env.example .env` — set at least `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` if you want snapshots on the phone.
+Set at least `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, and `SUPABASE_BUCKET=cheating-snapshots` in `backend/.env` if you want snapshots on the phone.
 
-From **repository root** (folder that contains `backend/`):
+From the **`FYP Web/` folder** (the one that contains `backend/`), start the API:
 
 ```bash
-py -3 -m uvicorn backend.main:app --reload
+py -3 -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-API: `http://localhost:8000`.
+> ⚠️ **The `--host 0.0.0.0` flag is mandatory if the Android app is on a separate device.**
+> Without it, uvicorn binds to `127.0.0.1` only and your phone gets *connection timeout*.
+> If you only test from the same machine (browser dashboard), `--host 0.0.0.0` is still safe.
+
+You should see:
+
+```
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+```
+
+API health check from the laptop's browser: `http://localhost:8000/`
+API health check from the phone's browser: `http://<laptop-LAN-IP>:8000/` (e.g. `http://192.168.1.35:8000/`)
+
+#### Optional: skip the flag with a one-line entry point
+
+`backend/main.py` already exposes a `main()` that reads host/port from `config.py` (defaults to `0.0.0.0:8000`). So this also works and needs no flags:
+
+```bash
+py -3 -m backend.main
+```
+
+Use the `uvicorn ... --reload` form during active development for hot-reload, and `py -3 -m backend.main` for normal use.
 
 ### Frontend
 
 ```bash
 cd frontend
-cp .env.example .env
+cp .env.example .env   # PowerShell: Copy-Item .env.example .env
 npm install
 npm run dev
 ```
 
 Open `http://localhost:3000`. Sign in with Supabase, or use dev bypass if enabled (see above).
+
+### Run order (typical dev session)
+
+You'll have **two terminals** open side-by-side, plus optionally Android Studio for the phone app:
+
+| Terminal | Folder | Command | Purpose |
+|----------|--------|---------|---------|
+| 1 | `FYP Web/` | `py -3 -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000` | YOLO/MediaPipe detector + REST/WebSocket API on `:8000` |
+| 2 | `FYP Web/frontend/` | `npm run dev` | Next.js dashboard on `:3000` |
+| (3) | Android Studio | Run ▶ on the `FYP App` module | DrushtiAI invigilator app |
+
+Start the **backend first** — the dashboard's proxy and the phone both call it on startup, so launching them before uvicorn is up will show transient `ECONNREFUSED` errors that go away once the backend is ready.
+
+#### Allow port 8000 through Windows Firewall (one time)
+
+Run this in an **Administrator** PowerShell so the phone can reach the backend over Wi-Fi:
+
+```powershell
+New-NetFirewallRule -DisplayName "DrushtiAI backend" -Direction Inbound -LocalPort 8000 -Protocol TCP -Action Allow
+```
+
+#### `backend.url` for the Android app
+
+In `FYP App/local.properties` add the laptop's LAN IP (find it with `ipconfig` → *Wireless LAN adapter Wi-Fi* → IPv4 Address):
+
+```properties
+backend.url=http://192.168.1.35:8000
+```
+
+For the Android emulator running on the same laptop, use `http://10.0.2.2:8000` instead.
 
 ### Syncing detections to the Android app
 
