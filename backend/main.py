@@ -49,6 +49,9 @@ websocket_clients: Dict[str, List[WebSocket]] = {}  # camera_id -> list of webso
 incident_callbacks: List = []
 # When starting a stream with an exam_id, detections upload to cheating_snapshots for the Android app.
 camera_exam_ids: Dict[str, str] = {}
+# Reference to the FastAPI event loop — needed because the camera processing
+# thread cannot use asyncio.create_task() (no running loop in that thread).
+main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 # -------------------- Pydantic Models --------------------
@@ -96,8 +99,9 @@ class SettingsUpdateRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     """Initialize resources on startup."""
-    global camera_manager
+    global camera_manager, main_event_loop
     camera_manager = CameraManager(config)
+    main_event_loop = asyncio.get_running_loop()
     print(f"[INFO] AntiCheat Vision System started")
     print(f"[INFO] Environment: {config.environment}")
     print(f"[INFO] Output directory: {config.camera.output_dir}")
@@ -266,14 +270,20 @@ async def start_stream(camera_id: str, exam_id: Optional[str] = None):
         camera_exam_ids.pop(camera_id, None)
         print(f"[API] No exam_id — stream will run without Supabase snapshot upload")
 
-    # Define callback for WebSocket broadcasting
-    async def on_detection(result: StreamResult):
-        await broadcast_detection(camera_id, result)
+    # The camera runs in a background thread, so we must hand the coroutine
+    # to the FastAPI event loop via run_coroutine_threadsafe.
+    loop = main_event_loop
 
-    # Start stream (using sync callback wrapper)
     def sync_callback(result: StreamResult):
-        # Schedule async broadcast
-        asyncio.create_task(broadcast_detection(camera_id, result))
+        if loop is None or not loop.is_running():
+            print("[WARN] Main event loop unavailable; dropping detection broadcast")
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                broadcast_detection(camera_id, result), loop
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to schedule broadcast_detection: {e}")
 
     success = camera_manager.start_stream(camera_id, on_detection=sync_callback)
 
@@ -506,43 +516,33 @@ async def websocket_feed(websocket: WebSocket, camera_id: str):
     """
     WebSocket endpoint for real-time detection streaming.
 
-    Sends detection results as they occur for the specified camera.
-
-    Args:
-        websocket: WebSocket connection
-        camera_id: ID of camera to monitor
+    Push-only: every new detection is sent exactly once via
+    broadcast_detection(). The connection is held open with periodic
+    pings — we no longer poll get_latest_result() because that re-sent
+    the same detection on every heartbeat and overloaded the dashboard.
     """
     await websocket.accept()
 
-    # Register client
     if camera_id not in websocket_clients:
         websocket_clients[camera_id] = []
     websocket_clients[camera_id].append(websocket)
 
     try:
         while True:
-            # Get latest result
-            result = camera_manager.get_latest_result(camera_id)
-
-            if result:
-                # Send results
-                data = {
-                    "camera_id": result.camera_id,
-                    "timestamp": result.timestamp,
-                    "detections": [r.to_dict() for r in result.results],
-                    "error": result.error
-                }
-                await websocket.send_json(data)
-
-            # Heartbeat interval
-            await asyncio.sleep(config.server.websocket_heartbeat)
-
+            # Hold connection open. Real updates arrive via broadcast_detection.
+            await asyncio.sleep(15.0)
+            try:
+                await websocket.send_json({"type": "ping"})
+            except Exception:
+                break
     except WebSocketDisconnect:
         pass
     finally:
-        # Unregister client
         if camera_id in websocket_clients:
-            websocket_clients[camera_id].remove(websocket)
+            try:
+                websocket_clients[camera_id].remove(websocket)
+            except ValueError:
+                pass
             if not websocket_clients[camera_id]:
                 del websocket_clients[camera_id]
 
@@ -597,29 +597,33 @@ async def broadcast_detection(camera_id: str, result: StreamResult):
     """
     exam_id = camera_exam_ids.get(camera_id)
 
-    # Store incident (mirror in memory for web dashboard; app uses Supabase)
+    # Only events with a saved snapshot are surfaced — this matches the 5-second
+    # cooldown in the detector and keeps the dashboard alert count in sync with
+    # the actual snapshot folder (and with Supabase).
+    persisted: List[Dict[str, Any]] = []
     for detection in result.results:
-        snapshot_url: Optional[str] = None
-        if detection.snapshot_path:
-            rel = f"/snapshots/{os.path.basename(detection.snapshot_path)}"
-            snapshot_url = rel
-            if (
-                exam_id
-                and supabase_configured(config)
-                and os.path.isfile(detection.snapshot_path)
-            ):
-                uploaded = await asyncio.to_thread(
-                    upload_snapshot_and_insert,
-                    config,
-                    exam_id,
-                    detection.snapshot_path,
-                    _snapshot_label(detection.behaviors),
-                )
-                if uploaded:
-                    snapshot_url = uploaded
+        if not detection.snapshot_path:
+            continue
+
+        snapshot_url = f"/snapshots/{os.path.basename(detection.snapshot_path)}"
+
+        # Upload to Supabase Storage + insert into cheating_snapshots so the
+        # mobile app for this exam_id can fetch them. The file was written
+        # synchronously by save_snapshot() inside the detector — no need to
+        # re-check existence on disk.
+        if exam_id and supabase_configured(config) and os.path.isfile(detection.snapshot_path):
+            uploaded = await asyncio.to_thread(
+                upload_snapshot_and_insert,
+                config,
+                exam_id,
+                detection.snapshot_path,
+                _snapshot_label(detection.behaviors),
+            )
+            if uploaded:
+                snapshot_url = uploaded
 
         incident = {
-            "id": detection.snapshot_path.split("_")[-1].split(".")[0] if detection.snapshot_path else None,
+            "id": os.path.basename(detection.snapshot_path).rsplit(".", 1)[0],
             "camera_id": camera_id,
             "behaviors": detection.behaviors,
             "confidence": detection.confidence,
@@ -628,16 +632,28 @@ async def broadcast_detection(camera_id: str, result: StreamResult):
             "exam_id": exam_id,
         }
         incidents.append(incident)
+        print(
+            f"[INCIDENT] cam={camera_id} track={detection.track_id} "
+            f"behaviors={detection.behaviors} conf={detection.confidence:.2f} "
+            f"snap={os.path.basename(detection.snapshot_path)} "
+            f"total_in_memory={len(incidents)}"
+        )
+        persisted.append({
+            "track_id": detection.track_id,
+            "behaviors": detection.behaviors,
+            "confidence": detection.confidence,
+            "timestamp": detection.timestamp,
+            "snapshot_url": snapshot_url,
+        })
 
-    # Broadcast to WebSocket clients
-    if camera_id in websocket_clients:
+    # Push to WebSocket clients ONLY when something was actually persisted.
+    if persisted and camera_id in websocket_clients:
         data = {
             "camera_id": result.camera_id,
             "timestamp": result.timestamp,
-            "detections": [r.to_dict() for r in result.results],
-            "error": result.error
+            "detections": persisted,
         }
-        for ws in websocket_clients[camera_id]:
+        for ws in list(websocket_clients[camera_id]):
             try:
                 await ws.send_json(data)
             except Exception:

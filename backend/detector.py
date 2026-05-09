@@ -88,6 +88,9 @@ class TrackState:
     previous_lip_distance: Optional[float] = None
     gaze_deviation_start: Optional[float] = None
     is_gaze_deviant: bool = False
+    # Number of consecutive analyzed frames yaw has been above threshold —
+    # used as a cheap stability filter to suppress single-frame jitter.
+    yaw_streak: int = 0
 
 
 @dataclass
@@ -135,6 +138,14 @@ class CheatingDetector:
     LEFT_IRIS_CENTER = 468
     RIGHT_IRIS_CENTER = 473
 
+    # YOLO COCO class IDs for prohibited objects
+    PROHIBITED_CLASSES = {
+        67: "phone",
+        73: "book",
+        63: "laptop",
+        76: "scissors",
+    }
+
     def __init__(self, config: Config):
         """
         Initialize the CheatingDetector with configuration.
@@ -157,6 +168,26 @@ class CheatingDetector:
         # Frame counter for frame skipping
         self.frame_count = 0
 
+        # Cooldown between emitting the same event (incident + snapshot) per key
+        cooldown = getattr(config.detection, "incident_cooldown_sec", 5.0)
+        self._cooldown_sec: float = cooldown
+        self._last_event_time: Dict[str, float] = {}
+
+        # Snapshot cooldown (same value — only save a file when an event is emitted)
+        self.last_snapshot_time = self._last_event_time
+        self.snapshot_cooldown_sec: float = self._cooldown_sec
+
+        # Active bounding boxes from last processed frame (tid -> (x1,y1,x2,y2))
+        self.active_tracks: Dict[int, Tuple[int, int, int, int]] = {}
+        # Face bbox per track for the most recent processed frame
+        self.track_face_boxes: Dict[int, Tuple[int, int, int, int]] = {}
+
+        # Track-disappearance bookkeeping for true "left seat" detection.
+        # tid -> (last_seen_time, last_bbox)
+        self._last_seen: Dict[int, Tuple[float, Tuple[int, int, int, int]]] = {}
+        self._left_seat_fired: set = set()
+        self.left_seat_grace_sec: float = 6.0
+
         # Output directory for snapshots
         self.output_dir = config.camera.output_dir
         os.makedirs(self.output_dir, exist_ok=True)
@@ -176,7 +207,7 @@ class CheatingDetector:
             print("[INFO] Using legacy FaceMesh API")
             self.face_mesh = FaceMesh(
                 static_image_mode=False,
-                max_num_faces=1,
+                max_num_faces=10,  # detect up to 10 students simultaneously
                 min_detection_confidence=self.detection.face_detection_confidence,
                 min_tracking_confidence=self.detection.face_tracking_confidence
             )
@@ -196,7 +227,7 @@ class CheatingDetector:
             options = vision.FaceLandmarkerOptions(
                 base_options=base_options,
                 running_mode=vision.RunningMode.IMAGE,
-                num_faces=1,
+                num_faces=10,  # detect up to 10 students simultaneously
                 min_face_detection_confidence=self.detection.face_detection_confidence
             )
             self.face_landmarker = vision.FaceLandmarker.create_from_options(options)
@@ -225,8 +256,14 @@ class CheatingDetector:
         raise RuntimeError(f"Failed to download FaceLandmarker model: {last_err}")
 
     def _init_tracker(self):
-        """Initialize DeepSort tracker."""
-        self.tracker = DeepSort(max_age=self.detection.track_max_age)
+        """Initialize DeepSort tracker.
+        n_init=1 → tracks confirm on the first detection so every student gets
+        a bbox immediately. Default of 3 made students invisible for ~3s.
+        """
+        self.tracker = DeepSort(
+            max_age=self.detection.track_max_age,
+            n_init=1,
+        )
 
     def _landmarks_to_2d_points(self, landmarks, w: int, h: int) -> np.ndarray:
         """
@@ -364,21 +401,132 @@ class CheatingDetector:
         except (IndexError, AttributeError):
             return None
 
-    def save_snapshot(self, frame: np.ndarray, note: str) -> str:
-        """
-        Save a snapshot of the current frame.
+    # ── Shared bounding box drawing style ──────────────────────────────────
+    # Red box + red filled label bar with white text, matching reference screenshot.
+    BOX_COLOR_ALERT = (0, 0, 255)        # BGR: red
+    BOX_COLOR_OK = (0, 200, 0)            # BGR: green
+    BOX_THICKNESS = 3
+    LABEL_FONT = cv2.FONT_HERSHEY_SIMPLEX
+    LABEL_SCALE = 0.7
+    LABEL_FONT_THICKNESS = 2
+    LABEL_TEXT_COLOR = (255, 255, 255)   # white
 
-        Args:
-            frame: BGR frame to save
-            note: Description for filename
+    def _draw_labeled_box(
+        self,
+        img: np.ndarray,
+        x1: int, y1: int, x2: int, y2: int,
+        label: str,
+        color: Tuple[int, int, int],
+    ) -> None:
+        """Draw a thick rectangle with a filled label bar above it (red bar / white text)."""
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, self.BOX_THICKNESS)
 
-        Returns:
-            Path to saved snapshot
+        (tw, th), baseline = cv2.getTextSize(
+            label, self.LABEL_FONT, self.LABEL_SCALE, self.LABEL_FONT_THICKNESS
+        )
+        pad_x, pad_y = 8, 6
+        bar_h = th + baseline + pad_y * 2
+
+        # Place bar above the box; if no room above, place inside top
+        bar_y2 = y1
+        bar_y1 = bar_y2 - bar_h
+        if bar_y1 < 0:
+            bar_y1 = y1
+            bar_y2 = y1 + bar_h
+
+        bar_x1 = x1
+        bar_x2 = min(x1 + tw + pad_x * 2, img.shape[1] - 1)
+
+        cv2.rectangle(img, (bar_x1, bar_y1), (bar_x2, bar_y2), color, -1)
+        cv2.putText(
+            img, label,
+            (bar_x1 + pad_x, bar_y2 - pad_y - baseline // 2),
+            self.LABEL_FONT, self.LABEL_SCALE,
+            self.LABEL_TEXT_COLOR, self.LABEL_FONT_THICKNESS,
+            cv2.LINE_AA,
+        )
+
+    @staticmethod
+    def _format_behavior_label(behavior: str, confidence: float) -> str:
+        """'looking_sideways' + 0.85 → 'Looking sideways: 0.85'."""
+        pretty = behavior.replace("_", " ").replace(":", ": ").capitalize()
+        return f"{pretty}: {confidence:.2f}"
+
+    def _can_emit(self, key: str, current_time: float) -> bool:
         """
-        timestamp = int(time.time() * 1000)
-        filename = f"{note}_{timestamp}.jpg"
+        Return True if the cooldown has elapsed for this event key.
+        Marks the key as used (so the next call within the cooldown returns False).
+        """
+        last = self._last_event_time.get(key, 0.0)
+        if (current_time - last) >= self._cooldown_sec:
+            self._last_event_time[key] = current_time
+            return True
+        return False
+
+    def _can_save_snapshot(self, key: str, current_time: float) -> bool:
+        """Alias kept for backwards compatibility — same gate as _can_emit."""
+        return key in self._last_event_time and (
+            current_time - self._last_event_time[key] < self._cooldown_sec
+        )
+
+    def save_snapshot(
+        self,
+        frame: np.ndarray,
+        note: str,
+        *,
+        camera_id: str = "",
+        exam_id: str = "",
+        student_id: str = "",
+        track_id: Optional[int] = None,
+        behaviors: Optional[List[str]] = None,
+        confidence: float = 0.0,
+        face_box: Optional[Tuple[int, int, int, int]] = None,
+        object_boxes: Optional[List[Tuple[int, int, int, int, str]]] = None,
+    ) -> str:
+        """
+        Save an annotated snapshot with metadata baked in.
+
+        Layout matches the dashboard preview style: red bbox + red label bar
+        with white text 'Behavior: confidence', plus a black metadata strip
+        at the bottom.
+        """
+        img = frame.copy()
+        h, w = img.shape[:2]
+
+        primary_behavior = (behaviors[0] if behaviors else "incident")
+
+        # ── Subject (person) box with violation label ─────────────────────
+        if face_box is not None:
+            fx1, fy1, fx2, fy2 = face_box
+            label = self._format_behavior_label(primary_behavior, confidence)
+            self._draw_labeled_box(img, fx1, fy1, fx2, fy2, label, self.BOX_COLOR_ALERT)
+
+        # ── Prohibited object boxes ───────────────────────────────────────
+        for ox1, oy1, ox2, oy2, lbl in (object_boxes or []):
+            obj_label = self._format_behavior_label(f"object: {lbl}", 1.0)
+            self._draw_labeled_box(img, ox1, oy1, ox2, oy2, obj_label, self.BOX_COLOR_ALERT)
+
+        # ── Metadata strip at bottom (black bar, white text) ──────────────
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        behavior_str = ", ".join(behaviors) if behaviors else "unknown"
+        lines = [
+            f"Time: {ts}   Camera: {camera_id}",
+            f"Exam ID: {exam_id}   Student ID: {student_id}   Track ID: {track_id}",
+            f"Event: {behavior_str}   Confidence: {confidence:.2f}",
+        ]
+
+        line_h = 24
+        bar_h = line_h * len(lines) + 12
+        cv2.rectangle(img, (0, h - bar_h), (w, h), (0, 0, 0), -1)
+        for i, line in enumerate(lines):
+            y = h - bar_h + 22 + i * line_h
+            cv2.putText(img, line, (10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+        timestamp_ms = int(time.time() * 1000)
+        filename = f"{note}_{timestamp_ms}.jpg"
         filepath = os.path.join(self.output_dir, filename)
-        cv2.imwrite(filepath, frame)
+        cv2.imwrite(filepath, img)
         return filepath
 
     def detect_persons(self, frame: np.ndarray) -> List[Tuple[int, int, int, int, float, int]]:
@@ -409,16 +557,153 @@ class CheatingDetector:
 
         return detections
 
-    def process_face(self, frame: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], bool, Optional[float]]:
+    def detect_objects(self, frame: np.ndarray) -> List[Tuple[int, int, int, int, float, str]]:
         """
-        Process face region for head pose, gaze, and lip movement.
-
-        Args:
-            frame: Full BGR frame
-            x1, y1, x2, y2: Bounding box coordinates
+        Detect prohibited objects (phone, book, laptop) using YOLO.
 
         Returns:
-            Tuple of (yaw, pitch, roll, gaze_deviation, face_detected, lip_distance)
+            List of (x1, y1, x2, y2, confidence, label) tuples above 0.5 threshold.
+        """
+        prohibited_ids = list(self.PROHIBITED_CLASSES.keys())
+        results = self.yolo.predict(
+            source=frame,
+            imgsz=self.detection.yolo_img_size,
+            conf=0.5,
+            classes=prohibited_ids,
+            verbose=False,
+        )
+        detections = []
+        for r in results:
+            for box in r.boxes:
+                cls = int(box.cls[0])
+                if cls not in self.PROHIBITED_CLASSES:
+                    continue
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = float(box.conf[0])
+                label = self.PROHIBITED_CLASSES[cls]
+                detections.append((x1, y1, x2, y2, conf, label))
+        return detections
+
+    def _face_descriptor_from_landmarks(
+        self, landmarks, frame_w: int, frame_h: int
+    ) -> Optional[Dict[str, Any]]:
+        """Build a compact face descriptor (bbox + yaw) from MediaPipe landmarks.
+
+        Returns None if essential landmarks are missing.
+        """
+        try:
+            nose = landmarks[self.NOSE_TIP]
+            le = landmarks[self.LEFT_EYE_OUTER]
+            re = landmarks[self.RIGHT_EYE_OUTER]
+        except (IndexError, AttributeError):
+            return None
+
+        d_left = abs(nose.x - le.x)
+        d_right = abs(nose.x - re.x)
+        asymmetry = (d_left - d_right) / max(d_left + d_right, 1e-6)
+        yaw_deg = float(asymmetry * 120.0)
+
+        # Tight bbox from landmarks, padded for context (forehead, chin)
+        xs = [lm.x for lm in landmarks]
+        ys = [lm.y for lm in landmarks]
+        x1n, x2n = min(xs), max(xs)
+        y1n, y2n = min(ys), max(ys)
+
+        x1 = int(max(0, x1n * frame_w))
+        x2 = int(min(frame_w - 1, x2n * frame_w))
+        y1 = int(max(0, y1n * frame_h))
+        y2 = int(min(frame_h - 1, y2n * frame_h))
+
+        # Add ~25% vertical padding (forehead is above eyes, chin below)
+        h_pad = int((y2 - y1) * 0.25)
+        y1 = max(0, y1 - h_pad)
+        y2 = min(frame_h - 1, y2 + h_pad // 2)
+
+        return {
+            "bbox": (x1, y1, x2, y2),
+            "yaw": yaw_deg,
+            "asymmetry": asymmetry,
+            "center": ((x1 + x2) // 2, (y1 + y2) // 2),
+        }
+
+    def detect_all_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """Run face detection on the FULL frame and return descriptors for every face.
+
+        Critical for the multi-student case: face_mesh on per-YOLO-bbox crops
+        misattributes faces when bboxes overlap. Running on the whole frame
+        once gives every student their own independent face descriptor.
+        """
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        descriptors: List[Dict[str, Any]] = []
+
+        if self.use_legacy:
+            results = self.face_mesh.process(rgb)
+            if not results.multi_face_landmarks:
+                return descriptors
+            for face in results.multi_face_landmarks:
+                desc = self._face_descriptor_from_landmarks(face.landmark, w, h)
+                if desc is not None:
+                    descriptors.append(desc)
+        else:
+            from mediapipe import Image, ImageFormat
+            mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
+            detection_result = self.face_landmarker.detect(mp_image)
+            if not detection_result.face_landmarks:
+                return descriptors
+            for face_landmarks in detection_result.face_landmarks:
+                desc = self._face_descriptor_from_landmarks(face_landmarks, w, h)
+                if desc is not None:
+                    descriptors.append(desc)
+
+        return descriptors
+
+    @staticmethod
+    def _match_faces_to_tracks(
+        tracks: Dict[int, Tuple[int, int, int, int]],
+        faces: List[Dict[str, Any]],
+    ) -> Dict[int, Dict[str, Any]]:
+        """Greedy 1-to-1 matching: each YOLO track gets its closest unique face."""
+        matches: Dict[int, Dict[str, Any]] = {}
+        used = set()
+
+        # Sort by largest bbox first so prominent students get faces assigned first
+        sorted_tracks = sorted(
+            tracks.items(),
+            key=lambda kv: (kv[1][2] - kv[1][0]) * (kv[1][3] - kv[1][1]),
+            reverse=True,
+        )
+
+        for tid, (x1, y1, x2, y2) in sorted_tracks:
+            tcx, tcy = (x1 + x2) // 2, (y1 + y2) // 2
+            best_idx, best_dist = None, float("inf")
+            margin = 30  # pixels of slack outside the bbox
+            for i, face in enumerate(faces):
+                if i in used:
+                    continue
+                fcx, fcy = face["center"]
+                if not (x1 - margin <= fcx <= x2 + margin and
+                        y1 - margin <= fcy <= y2 + margin):
+                    continue
+                dist = ((fcx - tcx) ** 2 + (fcy - tcy) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist, best_idx = dist, i
+
+            if best_idx is not None:
+                matches[tid] = faces[best_idx]
+                used.add(best_idx)
+
+        return matches
+
+    def process_face(
+        self, frame: np.ndarray, x1: int, y1: int, x2: int, y2: int
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], bool, Optional[float], int]:
+        """
+        Process face region for head pose, gaze, lip movement, and face count.
+
+        Returns:
+            Tuple of (yaw, pitch, roll, gaze_deviation, face_detected, lip_distance, num_faces)
+            num_faces > 1 indicates multiple people in the crop region.
         """
         h0, w0 = frame.shape[:2]
 
@@ -431,7 +716,7 @@ class CheatingDetector:
         head_crop = frame[top:bottom, left:right]
 
         if head_crop.size == 0:
-            return None, None, None, None, False, None
+            return None, None, None, None, False, None, 0
 
         # Convert to RGB for MediaPipe
         rgb = cv2.cvtColor(head_crop, cv2.COLOR_BGR2RGB)
@@ -440,36 +725,66 @@ class CheatingDetector:
         if self.use_legacy:
             results = self.face_mesh.process(rgb)
             if not results.multi_face_landmarks:
-                return None, None, None, None, False, None
+                return None, None, None, None, False, None, 0
+            num_faces = len(results.multi_face_landmarks)
             landmarks = results.multi_face_landmarks[0].landmark
         else:
             from mediapipe import Image, ImageFormat
             mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
             detection_result = self.face_landmarker.detect(mp_image)
             if not detection_result.face_landmarks:
-                return None, None, None, None, False, None
+                return None, None, None, None, False, None, 0
+            num_faces = len(detection_result.face_landmarks)
             landmarks = detection_result.face_landmarks[0]
 
         crop_h, crop_w = head_crop.shape[:2]
 
-        # Get head pose
-        yaw, pitch, roll = self.estimate_head_pose(landmarks, crop_w, crop_h)
+        # Reject tiny crops — solvePnP is unreliable below ~80px
+        if crop_w < 80 or crop_h < 80:
+            return None, None, None, None, False, None, 0
 
-        # Get gaze deviation
+        # ── Robust yaw via nose-eye asymmetry (primary signal) ──────────
+        # solvePnP is wildly unreliable when the YOLO bbox extends past the
+        # face into background — it frequently returns 90°+ for forward-facing
+        # students. We use asymmetry of nose-x vs eye corners instead:
+        #   asymmetry ∈ [-1, +1]:  0 = forward, ±0.20 = mild turn, ±0.45 = profile
+        # Convert asymmetry directly to a degree-equivalent yaw so the rest of
+        # the pipeline keeps using the same threshold semantics.
+        try:
+            nose_x = landmarks[self.NOSE_TIP].x
+            le_x = landmarks[self.LEFT_EYE_OUTER].x
+            re_x = landmarks[self.RIGHT_EYE_OUTER].x
+            d_left = abs(nose_x - le_x)
+            d_right = abs(nose_x - re_x)
+            asymmetry = (d_left - d_right) / max(d_left + d_right, 1e-6)
+        except (IndexError, AttributeError):
+            asymmetry = 0.0
+
+        # Map asymmetry to a yaw-like angle (deg). |asymmetry|=0.5 ≈ 60°.
+        yaw = float(asymmetry * 120.0)
+        pitch = 0.0
+        roll = 0.0
+
         gaze_deviation = self.estimate_gaze_deviation(landmarks, crop_w, crop_h)
-
-        # Get lip distance
         lip_distance = self.estimate_lip_distance(landmarks, crop_w, crop_h)
 
-        return yaw, pitch, roll, gaze_deviation, True, lip_distance
+        return yaw, pitch, roll, gaze_deviation, True, lip_distance, num_faces
 
-    def process_frame(self, frame: np.ndarray, camera_id: str = "default") -> List[DetectionResult]:
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        camera_id: str = "default",
+        exam_id: str = "",
+        student_id: str = "",
+    ) -> List[DetectionResult]:
         """
         Process a single frame and detect cheating behaviors.
 
         Args:
             frame: BGR frame to process
             camera_id: Identifier for the camera source
+            exam_id: Exam identifier baked into snapshots
+            student_id: Student identifier baked into snapshots
 
         Returns:
             List of DetectionResult objects for each detected violation
@@ -477,138 +792,164 @@ class CheatingDetector:
         self.frame_count += 1
         current_time = time.time()
 
-        # Skip frames if configured
         if self.frame_count % (self.detection.frame_skip + 1) != 0:
             return []
 
         h0, w0 = frame.shape[:2]
 
-        # Detect persons
-        detections = self.detect_persons(frame)
+        # ── Detection passes (all run on the full frame) ──────────────────
+        person_detections = self.detect_persons(frame)
+        object_detections = self.detect_objects(frame)
+        all_faces = self.detect_all_faces(frame)
 
-        # Format for DeepSort: [bbox, confidence, class]
-        ds_detections = [([d[0], d[1], d[2], d[3]], d[4], 'person') for d in detections]
-
-        # Update tracker
+        # ── Track persons via DeepSort for stable IDs ─────────────────────
+        ds_detections = [
+            ([d[0], d[1], d[2], d[3]], d[4], "person") for d in person_detections
+        ]
         tracks = self.tracker.update_tracks(ds_detections, frame=frame)
 
-        # Collect active tracks
-        active_tracks = {}
+        active_tracks: Dict[int, Tuple[int, int, int, int]] = {}
         for tr in tracks:
             if not tr.is_confirmed():
                 continue
             tid = tr.track_id
-            ltrb = tr.to_ltrb()
-            x1, y1, x2, y2 = map(int, ltrb)
+            x1, y1, x2, y2 = map(int, tr.to_ltrb())
             active_tracks[tid] = (x1, y1, x2, y2)
+
+        self.active_tracks = active_tracks
+
+        # ── 1:1 face → track assignment (each student gets their own face) ─
+        track_faces = self._match_faces_to_tracks(active_tracks, all_faces)
+        self.track_face_boxes = {
+            tid: face["bbox"] for tid, face in track_faces.items()
+        }
+
+        # Build object box list for snapshot annotation
+        obj_boxes: List[Tuple[int, int, int, int, str]] = [
+            (ox1, oy1, ox2, oy2, lbl)
+            for ox1, oy1, ox2, oy2, _conf, lbl in object_detections
+        ]
 
         results = []
 
-        # Process each track
+        # ── Multiple-person flag (entire frame) ────────────────────────────
+        # Note: in classroom mode this fires often (it's a class!) — leave it as
+        # info; downstream UI can decide whether to surface it. Disabled when
+        # only one person is expected in front of the camera.
+        if len(active_tracks) > 1 and self.detection.flag_multiple_persons:
+            key = f"{camera_id}_multi_face"
+            if self._can_emit(key, current_time):
+                snap = self.save_snapshot(
+                    frame.copy(), f"{camera_id}_multi",
+                    camera_id=camera_id, exam_id=exam_id, student_id=student_id,
+                    behaviors=["multiple_persons"], confidence=0.9,
+                    object_boxes=obj_boxes,
+                )
+                results.append(DetectionResult(
+                    cheating_detected=True, behaviors=["multiple_persons"],
+                    confidence=0.9, face_detected=True,
+                    timestamp=datetime.now().isoformat(), snapshot_path=snap,
+                ))
+
+        # ── Prohibited object flag ──────────────────────────────────────────
+        if object_detections:
+            key = f"{camera_id}_objects"
+            if self._can_emit(key, current_time):
+                obj_labels = list({lbl for *_, lbl in object_detections})
+                behaviors_obj = [f"prohibited_object:{lbl}" for lbl in obj_labels]
+                obj_conf = max(d[4] for d in object_detections)
+                snap = self.save_snapshot(
+                    frame.copy(), f"{camera_id}_obj",
+                    camera_id=camera_id, exam_id=exam_id, student_id=student_id,
+                    behaviors=behaviors_obj, confidence=obj_conf,
+                    object_boxes=obj_boxes,
+                )
+                results.append(DetectionResult(
+                    cheating_detected=True, behaviors=behaviors_obj,
+                    confidence=obj_conf,
+                    face_detected=bool(active_tracks),
+                    timestamp=datetime.now().isoformat(), snapshot_path=snap,
+                ))
+
+        # ── Per-person behavioral checks ───────────────────────────────────
+        # Stability filter: yaw must exceed threshold for `streak_required`
+        # consecutive analyzed frames before triggering. Suppresses 1-frame
+        # jitter without the duration-then-snapshot lag (snapshot is taken
+        # the moment the streak threshold is hit, while the student IS turned).
+        STREAK_REQUIRED = 2
+
         for tid, (x1, y1, x2, y2) in active_tracks.items():
-            # Calculate centroid (bottom center)
             cx, cy = (x1 + x2) // 2, y2
 
-            # Get or create track state
             state = self.track_states.get(tid, TrackState(track_id=tid))
             state.centroid = (cx, cy)
             state.last_seen = current_time
 
-            # Process face
-            yaw, pitch, roll, gaze_dev, face_detected, lip_dist = self.process_face(frame, x1, y1, x2, y2)
+            face = track_faces.get(tid)
+            face_detected = face is not None
+            yaw = face["yaw"] if face_detected else None
+            face_box_for_snapshot = face["bbox"] if face_detected else (x1, y1, x2, y2)
 
-            behaviors = []
-            confidence = 0.0
+            candidate_behaviors: List[tuple] = []
 
             if face_detected and yaw is not None:
                 state.face_absence_start = None
                 state.left_seat = False
 
-                # Check head yaw (looking sideways)
                 if abs(yaw) > self.detection.look_yaw_threshold_deg:
-                    if state.look_start is None:
-                        state.look_start = current_time
-                    elif not state.is_looking_away:
-                        if current_time - state.look_start >= self.detection.look_duration_sec:
-                            state.is_looking_away = True
-                            behaviors.append("looking_sideways")
-                            confidence = max(confidence, 0.7 + abs(yaw) / 300)
+                    state.yaw_streak += 1
+                    if state.yaw_streak >= STREAK_REQUIRED:
+                        state.is_looking_away = True
+                        # Confidence scales with how far past threshold the yaw is.
+                        excess = abs(yaw) - self.detection.look_yaw_threshold_deg
+                        conf = min(0.7 + excess / 60.0, 1.0)
+                        candidate_behaviors.append(("looking_sideways", conf))
                 else:
-                    state.look_start = None
+                    state.yaw_streak = 0
                     state.is_looking_away = False
-
-                # Check gaze deviation
-                if gaze_dev is not None and gaze_dev > self.detection.gaze_deviation_threshold:
-                    if state.gaze_deviation_start is None:
-                        state.gaze_deviation_start = current_time
-                    elif not state.is_gaze_deviant:
-                        if current_time - state.gaze_deviation_start >= self.detection.look_duration_sec:
-                            state.is_gaze_deviant = True
-                            behaviors.append("gaze_deviation")
-                            confidence = max(confidence, 0.6 + gaze_dev * 0.3)
-                else:
-                    state.gaze_deviation_start = None
-                    state.is_gaze_deviant = False
-
-                # Check lip movement (talking)
-                if lip_dist is not None:
-                    if state.previous_lip_distance is not None:
-                        lip_change = abs(lip_dist - state.previous_lip_distance)
-                        if lip_change > self.detection.lip_movement_threshold:
-                            if state.lip_movement_start is None:
-                                state.lip_movement_start = current_time
-                            elif not state.is_talking:
-                                if current_time - state.lip_movement_start >= self.detection.talking_duration_sec:
-                                    state.is_talking = True
-                                    behaviors.append("talking")
-                                    confidence = max(confidence, 0.65)
-                        else:
-                            state.lip_movement_start = None
-                            state.is_talking = False
-                    state.previous_lip_distance = lip_dist
-
             else:
-                # Face not detected - check for absence
-                if state.face_absence_start is None:
-                    state.face_absence_start = current_time
-                elif not state.left_seat:
-                    if current_time - state.face_absence_start >= self.detection.face_absence_duration_sec:
-                        state.left_seat = True
-                        behaviors.append("left_seat")
-                        confidence = 0.8
+                # YOLO sees the person but face mesh found no face for them.
+                # This is normal when looking down to write — NOT "left seat".
+                state.face_absence_start = None
+                state.yaw_streak = 0
 
             self.track_states[tid] = state
 
-            # Create result if behaviors detected
-            if behaviors:
-                snapshot_path = self.save_snapshot(frame.copy(), f"{camera_id}_id{tid}")
+            # ── Cooldown gate (5s per behavior per track) ─────────────────
+            emittable: List[str] = []
+            max_conf = 0.0
+            for behavior_name, conf_val in candidate_behaviors:
+                bkey = f"{camera_id}_id{tid}_{behavior_name}"
+                if self._can_emit(bkey, current_time):
+                    emittable.append(behavior_name)
+                    max_conf = max(max_conf, conf_val)
 
-                result = DetectionResult(
-                    cheating_detected=True,
-                    behaviors=behaviors,
-                    confidence=min(confidence, 1.0),
-                    face_detected=face_detected,
-                    timestamp=datetime.now().isoformat(),
-                    track_id=tid,
-                    yaw=yaw,
-                    pitch=pitch,
-                    roll=roll,
-                    snapshot_path=snapshot_path
+            if emittable:
+                snap = self.save_snapshot(
+                    frame.copy(), f"{camera_id}_id{tid}",
+                    camera_id=camera_id, exam_id=exam_id, student_id=student_id,
+                    track_id=tid, behaviors=emittable, confidence=min(max_conf, 1.0),
+                    face_box=face_box_for_snapshot, object_boxes=obj_boxes,
                 )
-                results.append(result)
+                results.append(DetectionResult(
+                    cheating_detected=True, behaviors=emittable,
+                    confidence=min(max_conf, 1.0), face_detected=face_detected,
+                    timestamp=datetime.now().isoformat(),
+                    track_id=tid, yaw=yaw, pitch=0.0, roll=0.0,
+                    snapshot_path=snap,
+                ))
 
-        # Check proximity between pairs
+        # ── Proximity check ────────────────────────────────────────────────
         tids = list(active_tracks.keys())
         for i in range(len(tids)):
             for j in range(i + 1, len(tids)):
                 id1, id2 = tids[i], tids[j]
-
                 if id1 not in self.track_states or id2 not in self.track_states:
                     continue
 
                 c1 = np.array(self.track_states[id1].centroid)
                 c2 = np.array(self.track_states[id2].centroid)
-                dist = np.linalg.norm(c1 - c2)
+                dist = float(np.linalg.norm(c1 - c2))
 
                 pair_key = tuple(sorted((id1, id2)))
                 pair_state = self.pair_states.get(pair_key, PairState(track_ids=pair_key))
@@ -619,27 +960,62 @@ class CheatingDetector:
                     elif not pair_state.is_close:
                         if current_time - pair_state.start >= self.detection.proximity_duration_sec:
                             pair_state.is_close = True
-
-                            snapshot_path = self.save_snapshot(frame.copy(), f"{camera_id}_prox_{id1}_{id2}")
-
-                            result = DetectionResult(
-                                cheating_detected=True,
-                                behaviors=["proximity_cheating"],
-                                confidence=0.75,
-                                face_detected=True,
-                                timestamp=datetime.now().isoformat(),
-                                snapshot_path=snapshot_path
-                            )
-                            results.append(result)
+                            pkey = f"{camera_id}_prox_{id1}_{id2}"
+                            if self._can_emit(pkey, current_time):
+                                snap = self.save_snapshot(
+                                    frame.copy(), pkey,
+                                    camera_id=camera_id, exam_id=exam_id, student_id=student_id,
+                                    behaviors=["proximity_cheating"], confidence=0.75,
+                                    object_boxes=obj_boxes,
+                                )
+                                results.append(DetectionResult(
+                                    cheating_detected=True,
+                                    behaviors=["proximity_cheating"],
+                                    confidence=0.75, face_detected=True,
+                                    timestamp=datetime.now().isoformat(),
+                                    snapshot_path=snap,
+                                ))
                 else:
                     pair_state.start = None
                     pair_state.is_close = False
 
                 self.pair_states[pair_key] = pair_state
 
-        # Cleanup old states
-        self._cleanup_states(current_time)
+        # ── True "left seat" detection ─────────────────────────────────────
+        # Fires once when a previously-tracked person has been gone for
+        # `left_seat_grace_sec` consecutive seconds (DeepSort lost them).
+        for tid, (x1, y1, x2, y2) in active_tracks.items():
+            self._last_seen[tid] = (current_time, (x1, y1, x2, y2))
 
+        for tid, (last_t, bbox) in list(self._last_seen.items()):
+            gone_for = current_time - last_t
+            if gone_for >= self.left_seat_grace_sec and tid not in active_tracks:
+                if tid not in self._left_seat_fired:
+                    key = f"{camera_id}_left_seat_{tid}"
+                    if self._can_emit(key, current_time):
+                        self._left_seat_fired.add(tid)
+                        snap = self.save_snapshot(
+                            frame.copy(), key,
+                            camera_id=camera_id, exam_id=exam_id, student_id=student_id,
+                            track_id=tid, behaviors=["left_seat"], confidence=0.85,
+                            face_box=bbox, object_boxes=obj_boxes,
+                        )
+                        results.append(DetectionResult(
+                            cheating_detected=True, behaviors=["left_seat"],
+                            confidence=0.85, face_detected=False,
+                            timestamp=datetime.now().isoformat(),
+                            track_id=tid, snapshot_path=snap,
+                        ))
+            # Forget tracks that have been gone a long time
+            if gone_for > 60.0:
+                self._last_seen.pop(tid, None)
+                self._left_seat_fired.discard(tid)
+
+        # Clear left_seat_fired flag if track returns
+        for tid in active_tracks:
+            self._left_seat_fired.discard(tid)
+
+        self._cleanup_states(current_time)
         return results
 
     def _cleanup_states(self, current_time: float):
@@ -662,45 +1038,29 @@ class CheatingDetector:
 
     def get_annotated_frame(self, frame: np.ndarray, results: List[DetectionResult]) -> np.ndarray:
         """
-        Draw annotations on frame showing detected violations.
+        Draw live annotations using the same red-box style as saved snapshots.
 
-        Args:
-            frame: BGR frame
-            results: List of detection results
-
-        Returns:
-            Annotated BGR frame
+        Tracks with an active violation get a red box + label bar showing the
+        primary behavior and confidence. All other tracks get a thin green box.
         """
         annotated = frame.copy()
 
-        # Draw track bounding boxes
-        for tid, (x1, y1, x2, y2) in self.track_states.items():
-            state = self.track_states.get(tid)
+        # Map track_id → (primary_behavior, confidence) from this frame's results
+        tid_to_alert: Dict[int, Tuple[str, float]] = {}
+        for r in results:
+            if r.track_id is not None and r.behaviors:
+                tid_to_alert[r.track_id] = (r.behaviors[0], r.confidence)
 
-            # Default green box
-            color = (0, 255, 0)
-            label = f"ID:{tid}"
-
-            if state and state.is_looking_away:
-                color = (0, 0, 255)  # Red
-                label += " LOOK"
-            elif state and state.is_talking:
-                color = (0, 165, 255)  # Orange
-                label += " TALK"
-            elif state and state.left_seat:
-                color = (128, 128, 128)  # Gray
-                label += " LEFT"
-
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(annotated, label, (x1, y1 - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-        # Draw alerts for violations
-        for result in results:
-            for behavior in result.behaviors:
-                alert_text = f"ALERT: {behavior.upper()}"
-                cv2.putText(annotated, alert_text, (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        for tid, (x1, y1, x2, y2) in self.active_tracks.items():
+            # Prefer the tight face bbox over the loose YOLO person bbox
+            face_box = self.track_face_boxes.get(tid)
+            bx1, by1, bx2, by2 = face_box if face_box is not None else (x1, y1, x2, y2)
+            if tid in tid_to_alert:
+                behavior, conf = tid_to_alert[tid]
+                label = self._format_behavior_label(behavior, conf)
+                self._draw_labeled_box(annotated, bx1, by1, bx2, by2, label, self.BOX_COLOR_ALERT)
+            else:
+                cv2.rectangle(annotated, (bx1, by1), (bx2, by2), self.BOX_COLOR_OK, 1)
 
         return annotated
 

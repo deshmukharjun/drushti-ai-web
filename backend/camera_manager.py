@@ -294,8 +294,8 @@ class CameraStream:
             except Exception as e:
                 print(f"[ERROR] Processing error for camera {self.camera_info.id}: {e}")
 
-            # Frame rate control
-            time.sleep(1 / 30)  # Target ~30 FPS
+            # 5fps is more than sufficient for proctoring and keeps CPU load reasonable
+            time.sleep(1 / 5)
 
     def get_latest_frame(self) -> Optional[Any]:
         """

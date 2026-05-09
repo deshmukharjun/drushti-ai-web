@@ -22,36 +22,42 @@ class DetectionConfig:
     """Configuration for cheating detection thresholds."""
 
     # Head pose detection thresholds
-    look_yaw_threshold_deg: float = 15.0  # Degrees - head turn angle to flag
-    look_pitch_threshold_deg: float = 20.0  # Degrees - head up/down angle
-    look_duration_sec: float = 0.5  # Duration before alert triggers
+    look_yaw_threshold_deg: float = 25.0   # Degrees — raised to avoid false positives from slight turns
+    look_pitch_threshold_deg: float = 25.0  # Degrees - head up/down angle
+    look_duration_sec: float = 2.0          # Must look away for 2 s before flagging
 
     # Proximity detection thresholds
     proximity_pix: int = 150  # Pixels - distance threshold for overhead cam
     proximity_duration_sec: float = 2.0  # Duration before proximity alert
 
     # Gaze detection thresholds
-    gaze_deviation_threshold: float = 0.3  # Normalized (0-1) eye gaze deviation
+    gaze_deviation_threshold: float = 0.45  # Raised — 0.3 triggered on normal blinks/glances
 
     # Lip movement detection
-    lip_movement_threshold: float = 0.02  # Normalized lip openness change
-    talking_duration_sec: float = 1.5  # Continuous lip movement duration
+    lip_movement_threshold: float = 0.025  # Normalized lip openness change
+    talking_duration_sec: float = 2.5       # Require sustained talking before flagging
 
     # Face absence detection
     face_absence_duration_sec: float = 3.0  # Duration before "left seat" alert
 
     # YOLO detection settings
     yolo_img_size: int = 640
-    yolo_min_conf: float = 0.25
+    yolo_min_conf: float = 0.45             # Raised from 0.25 — fewer shadow/background false hits
     yolo_classes: List[int] = field(default_factory=lambda: [0])  # class 0 = person
 
     # Frame processing
-    frame_skip: int = 5  # Process every Nth frame
+    frame_skip: int = 5  # Process every Nth frame (camera loop runs at 5fps)
     track_max_age: int = 30  # DeepSort max tracking age
 
     # Face detection confidence
-    face_detection_confidence: float = 0.3
-    face_tracking_confidence: float = 0.3
+    face_detection_confidence: float = 0.5  # Raised from 0.3
+    face_tracking_confidence: float = 0.5   # Raised from 0.3
+
+    # Cooldown between emitting the same incident (seconds)
+    incident_cooldown_sec: float = 5.0
+
+    # Classroom mode: don't flag multiple persons (a class is supposed to have many)
+    flag_multiple_persons: bool = False
 
 
 @dataclass
@@ -59,7 +65,7 @@ class CameraConfig:
     """Configuration for camera streams."""
 
     default_source: str = "0"  # Default camera source
-    output_dir: str = "events_snapshots"
+    output_dir: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "events_snapshots")
     max_cameras: int = 10
     reconnect_timeout: int = 30  # Seconds to wait before reconnecting
 
