@@ -176,13 +176,21 @@ For QR payloads to be useful on-device, set **`NEXT_PUBLIC_BACKEND_PUBLIC_URL`**
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| GET | `/` | Health check |
 | GET | `/api/cameras` | List cameras |
 | POST | `/api/cameras` | Register a camera |
+| GET | `/api/cameras/devices/available` | Enumerate local webcam devices |
+| GET | `/api/cameras/{id}` | Get a single camera |
+| DELETE | `/api/cameras/{id}` | Remove a camera |
 | POST | `/api/cameras/{id}/start?exam_id=<uuid>` | Start stream; optional `exam_id` enables Supabase snapshot sync |
 | POST | `/api/cameras/{id}/stop` | Stop stream |
+| GET | `/api/cameras/{id}/frame` | Latest JPEG frame (JSON) |
+| GET | `/api/cameras/{id}/snapshot.jpg` | Latest JPEG frame (image) |
 | GET | `/api/incidents` | List in-memory incidents (dashboard) |
+| GET | `/api/incidents/{id}` | Get a single incident |
 | GET | `/api/incidents/export/csv` | Export CSV |
 | GET/POST | `/api/settings` | Detection thresholds |
+| GET | `/snapshots/{filename}` | Serve a locally mirrored snapshot |
 | WS | `/ws/feed/{camera_id}` | Live detections |
 | WS | `/ws/status` | Status |
 
