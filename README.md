@@ -4,7 +4,7 @@ Real-time cheating detection for exam surveillance, aligned with the **DrushtiAI
 
 ## Features
 
-- **Exams & QR pairing** — Create exams on the web; show a QR code encoding the same JSON contract as [QrLinkContract.kt](../FYP%20App/app/src/main/java/com/example/drushtiai/QrLinkContract.kt) (`v`, `exam_id`, optional `ws_url`, `ingest_url`).
+- **Exams** — Create exams on the web; the Android app reads the same `exams` table from Supabase.
 - **Multi-camera support** — Webcam, RTSP, MJPEG streams via FastAPI
 - **Real-time detection** — Head pose, gaze, talking, proximity, face absence
 - **Live dashboard** — WebSocket camera grid and alerts
@@ -58,7 +58,7 @@ Copy the template: `cd frontend && cp .env.example .env` (PowerShell: `Copy-Item
 | `NEXT_PUBLIC_SUPABASE_URL` | Same project as the Android app |
 | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY` | Publishable key (matches Supabase dashboard; legacy `NEXT_PUBLIC_SUPABASE_ANON_KEY` still works) |
 | `NEXT_PUBLIC_BACKEND_URL` | FastAPI origin for browser (e.g. `http://localhost:8000`) |
-| `NEXT_PUBLIC_BACKEND_PUBLIC_URL` | **URL the invigilator phone can reach** (LAN IP, ngrok, etc.) — used inside QR JSON for `ws_url` / `ingest_url` hints |
+| `NEXT_PUBLIC_BACKEND_PUBLIC_URL` | **URL the invigilator phone can reach** (LAN IP, ngrok, etc.) for direct stream/snapshot access |
 | `NEXT_PUBLIC_ENABLE_DEV_AUTH_BYPASS` | Set to `true` only in local dev to show **Continue without auth** and skip middleware session checks |
 
 If `NEXT_PUBLIC_SUPABASE_URL` is unset, the app runs in local dev mode (no auth required).
@@ -168,9 +168,9 @@ For the Android emulator running on the same laptop, use `http://10.0.2.2:8000` 
 1. Create an **exam** under **Exams** (or on the phone — same table).
 2. On **Cameras**, choose **Sync detections to exam** and select that exam.
 3. **Start** the camera stream. On each saved frame, the backend uploads a JPEG to Storage and inserts **`cheating_snapshots`** with a public **`image_url`**.
-4. On the phone, open the exam → **Link camera** → scan the **QR** from **Exams → (exam) → Link camera (QR)**.
+4. On the phone, open the exam — incidents appear in real time as the `cheating_snapshots` table is populated.
 
-For QR payloads to be useful on-device, set **`NEXT_PUBLIC_BACKEND_PUBLIC_URL`** to something reachable from the phone (not `localhost`).
+Set **`NEXT_PUBLIC_BACKEND_PUBLIC_URL`** to something reachable from the phone (not `localhost`) if you want the Android app to load live frames directly from the backend.
 
 ## API reference
 
